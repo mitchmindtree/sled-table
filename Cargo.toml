@@ -1,0 +1,11 @@
+[package]
+name = "sled-table"
+version = "0.1.0"
+authors = ["mitchmindtree <mitchell.nordine@gmail.com>"]
+
+[dependencies]
+bincode = "1"
+bytekey = { git = "https://github.com/mitchmindtree/bytekey", branch = "serde_and_stable" }
+serde = "1"
+serde_derive = "1"
+sled = "0.15"
