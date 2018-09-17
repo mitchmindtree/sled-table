@@ -55,9 +55,20 @@ pub struct Writer<'a, T> {
 
 /// An iterator yielding key/value pairs from a table of type `T`.
 pub struct Iter<'a, T> {
-    id_len: usize,
-    iter: sled::Iter<'a>,
+    iter_bytes: IterBytes<'a>,
     _table: PhantomData<T>,
+}
+
+/// An iterator yielding the byte representation of key/value pairs from a table of type `T`.
+///
+/// The yielded bytes for each entry are laid out as follows:
+///
+/// ```txt
+/// ([T::ID, T::Key], T::Value)
+/// ```
+pub struct IterBytes<'a> {
+    id_bytes: Vec<u8>,
+    iter: sled::Iter<'a>,
 }
 
 /// The possible errors that might occur while reading/writing a **Table** within a **sled::Tree**.
@@ -91,20 +102,43 @@ where
 
     /// Iterate over all key value pairs in the table.
     pub fn iter(&self) -> Result<Iter<'a, T>> {
-        let start_key_bytes: Vec<u8> = bytekey::serialize(&T::ID)?;
-        let id_len = start_key_bytes.len();
-        let iter = self.tree.scan(&start_key_bytes);
+        let iter_bytes = self.iter_bytes()?;
         let _table = PhantomData;
-        Ok(Iter { id_len, iter, _table })
+        Ok(Iter { iter_bytes, _table })
     }
 
     /// Iterate over tuples of keys and values, starting at the provided key.
     pub fn scan(&self, key: &T::Key) -> Result<Iter<'a, T>> {
-        let id_len = bytekey::serialize(&T::ID)?.len();
+        let iter_bytes = self.scan_bytes(key)?;
+        let _table = PhantomData;
+        Ok(Iter { iter_bytes, _table })
+    }
+
+    /// Iterate over the byte representation of all key/value pairs within the table.
+    ///
+    /// The yielded bytes for each entry are laid out as follows:
+    ///
+    /// ```txt
+    /// ([T::ID, T::Key], [T::Value])
+    /// ```
+    pub fn iter_bytes(&self) -> Result<IterBytes<'a>> {
+        let id_bytes: Vec<u8> = bytekey::serialize(&T::ID)?;
+        let iter = self.tree.scan(&id_bytes);
+        Ok(IterBytes { id_bytes, iter })
+    }
+
+    /// Iterate over the byte representation of all key/value pairs within the table.
+    ///
+    /// The yielded bytes for each entry are laid out as follows:
+    ///
+    /// ```txt
+    /// ([T::ID, T::Key], [T::Value])
+    /// ```
+    pub fn scan_bytes(&self, key: &T::Key) -> Result<IterBytes<'a>> {
+        let id_bytes = bytekey::serialize(&T::ID)?;
         let key_bytes = write_key::<T>(key)?;
         let iter = self.tree.scan(&key_bytes);
-        let _table = PhantomData;
-        Ok(Iter { id_len, iter, _table })
+        Ok(IterBytes { id_bytes, iter })
     }
 
     /// Return the minimum entry within the table.
@@ -152,6 +186,16 @@ where
             Some(Err(err)) => Err(err),
             Some(Ok(kv)) => Ok(Some(kv)),
         }
+    }
+
+    /// The size of the table on disk in bytes.
+    pub fn size_bytes(&self) -> Result<usize> {
+        let mut bytes = 0;
+        for res in self.iter_bytes()? {
+            let (k, v) = res?;
+            bytes += k.len() + v.len();
+        }
+        Ok(bytes)
     }
 }
 
@@ -258,26 +302,33 @@ impl<'a, T> ops::Deref for Writer<'a, T> {
     }
 }
 
-impl<'a, T> Iterator for Iter<'a, T>
-where
-    T: Table,
-{
-    type Item = Result<(T::Key, T::Value)>;
+impl<'a> Iterator for IterBytes<'a> {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
     fn next(&mut self) -> Option<Self::Item> {
         let (id_key_bytes, value_bytes) = match self.iter.next() {
             None => return None,
             Some(Err(err)) => return Some(Err(err.into())),
             Some(Ok(tuple)) => tuple,
         };
-        let id_bytes = &id_key_bytes[..self.id_len];
-        let key_bytes = &id_key_bytes[self.id_len..];
-        let id = match bytekey::deserialize(id_bytes) {
-            Err(err) => return Some(Err(err.into())),
-            Ok(id) => id,
-        };
-        if T::ID != id {
+        if self.id_bytes != &id_key_bytes[..self.id_bytes.len()] {
             return None;
         }
+        Some(Ok((id_key_bytes, value_bytes)))
+    }
+}
+
+impl<'a, T> Iterator for Iter<'a, T>
+where
+    T: Table,
+{
+    type Item = Result<(T::Key, T::Value)>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let (id_key_bytes, value_bytes) = match self.iter_bytes.next()? {
+            Err(err) => return Some(Err(err)),
+            Ok(kv) => kv,
+        };
+        let id_len = self.iter_bytes.id_bytes.len();
+        let key_bytes = &id_key_bytes[id_len..];
         let key = match bytekey::deserialize(key_bytes) {
             Err(err) => return Some(Err(err.into())),
             Ok(key) => key,
@@ -288,16 +339,6 @@ where
         };
         Some(Ok((key, value)))
     }
-}
-
-/// Write a key for table `T` to bytes.
-///
-/// This simply pre-pends the serialized `key` with a serialised instance of the table `ID`.
-pub fn write_key<T: Table>(key: &T::Key) -> bytekey::Result<Vec<u8>> {
-    let mut key_bytes = vec![];
-    bytekey::serialize_into(&mut key_bytes, &T::ID)?;
-    bytekey::serialize_into(&mut key_bytes, key)?;
-    Ok(key_bytes)
 }
 
 // Error implementations.
@@ -354,4 +395,28 @@ impl From<bytekey::de::Error> for Error {
     fn from(e: bytekey::de::Error) -> Self {
         Error::Bytekey(e.into())
     }
+}
+
+// Pure functions.
+
+/// Write a key for table `T` to bytes.
+///
+/// This simply pre-pends the serialized `key` with a serialised instance of the table `ID`.
+pub fn write_key<T: Table>(key: &T::Key) -> bytekey::Result<Vec<u8>> {
+    let mut key_bytes = vec![];
+    bytekey::serialize_into(&mut key_bytes, &T::ID)?;
+    bytekey::serialize_into(&mut key_bytes, key)?;
+    Ok(key_bytes)
+}
+
+/// Calculate the size of the given sled tree in bytes.
+///
+/// This is calculated by iterating over and summing all elements in the tree.
+pub fn tree_size_bytes(tree: &sled::Tree) -> sled::DbResult<usize, ()> {
+    let mut bytes = 0;
+    for res in tree {
+        let (k, v) = res?;
+        bytes += k.len() + v.len();
+    }
+    Ok(bytes)
 }
